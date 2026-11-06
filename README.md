@@ -55,13 +55,6 @@ Il vérifie les identifiants, les clés et le contenu des messages afin de déte
 
 Les rapports sont enregistrés dans `data/reports/`.
 
-## Tests et validation
-
-Les tests présents couvrent la préparation des données, le contrat des événements et le comportement du producteur. Des tests d’intégration permettent également de vérifier la publication et la réception avec un broker Kafka.
-
-La présence de ces tests ne signifie pas qu’ils ont tous été exécutés avec succès. Les résultats obtenus et les vérifications restantes sont consignés dans [docs/validation.md](docs/validation.md).
-
-Le schéma des événements et les règles de qualité sont décrits dans [docs/data-contract.md](docs/data-contract.md).
 
 ## Points restant à confirmer
 
