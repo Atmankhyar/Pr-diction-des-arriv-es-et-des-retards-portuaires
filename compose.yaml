@@ -1,0 +1,248 @@
+# Cluster complet du pipeline : Kafka, HDFS (1 NameNode + 2 DataNodes), Spark (1 master + 2 workers),
+# PostgreSQL (restitution) et Streamlit (tableau de bord).
+# Les jobs Spark et l'outil d'ingestion sont des services à lancer avec `docker compose run` (profils).
+name: port-eta
+
+x-spark-common: &spark-common
+  build:
+    context: ./infra/spark
+  image: port-eta/spark:3.5.3
+  environment: &spark-env
+    PYTHONPATH: /opt/app
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-768m}
+    SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-640m}
+    HDFS_URL: hdfs://namenode:9000
+    KAFKA_BOOTSTRAP_INTERNAL: kafka:9092
+    KAFKA_OBSERVATIONS_TOPIC: ${KAFKA_OBSERVATIONS_TOPIC:-maritime.observations.v1}
+    KAFKA_LABELS_TOPIC: ${KAFKA_LABELS_TOPIC:-maritime.labels.v1}
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: ${POSTGRES_DB:-port_eta}
+    POSTGRES_USER: ${POSTGRES_USER:-port_eta}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-port_eta}
+  volumes:
+    - ./:/opt/app
+
+x-hadoop-common: &hadoop-common
+  env_file: ./infra/hadoop/hadoop.env
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------- Ingestion
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    ports:
+      - "127.0.0.1:${KAFKA_HOST_PORT:-29092}:${KAFKA_HOST_PORT:-29092}"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:${KAFKA_HOST_PORT:-29092},CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-localhost}:${KAFKA_HOST_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms256m -Xmx384m}
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: [CMD-SHELL, "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      OBSERVATIONS_TOPIC: ${KAFKA_OBSERVATIONS_TOPIC:-maritime.observations.v1}
+      LABELS_TOPIC: ${KAFKA_LABELS_TOPIC:-maritime.labels.v1}
+      PARTITIONS: ${KAFKA_PARTITIONS:-3}
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        for topic in "$${OBSERVATIONS_TOPIC}" "$${LABELS_TOPIC}"; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions "$${PARTITIONS}" --replication-factor 1 --config retention.ms=604800000
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$topic"
+        done
+
+  # Outil d'ingestion conteneurisé (téléchargement, préparation, publication, contrôle).
+  ingestion:
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: infra/ingestion/Dockerfile
+    image: port-eta/ingestion:1.0
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_OBSERVATIONS_TOPIC: ${KAFKA_OBSERVATIONS_TOPIC:-maritime.observations.v1}
+      KAFKA_LABELS_TOPIC: ${KAFKA_LABELS_TOPIC:-maritime.labels.v1}
+    volumes:
+      - ./:/app
+    working_dir: /app
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- Stockage HDFS
+  namenode:
+    <<: *hadoop-common
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    hostname: namenode
+    environment:
+      CLUSTER_NAME: port-eta
+    ports:
+      - "127.0.0.1:9870:9870"
+    volumes:
+      - hdfs-namenode:/hadoop/dfs/name
+    healthcheck:
+      test: [CMD-SHELL, "curl -sf http://localhost:9870/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  datanode1:
+    <<: *hadoop-common
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    hostname: datanode1
+    environment:
+      SERVICE_PRECONDITION: namenode:9870
+    volumes:
+      - hdfs-datanode1:/hadoop/dfs/data
+    depends_on: [namenode]
+
+  datanode2:
+    <<: *hadoop-common
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    hostname: datanode2
+    environment:
+      SERVICE_PRECONDITION: namenode:9870
+    volumes:
+      - hdfs-datanode2:/hadoop/dfs/data
+    depends_on: [namenode]
+
+  # ---------------------------------------------------------------- Calcul Spark
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command: [/opt/spark/bin/spark-class, org.apache.spark.deploy.master.Master, --host, spark-master]
+    environment:
+      <<: *spark-env
+      SPARK_DAEMON_MEMORY: 256m
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    command: [/opt/spark/bin/spark-class, org.apache.spark.deploy.worker.Worker, spark://spark-master:7077]
+    environment: &worker-env
+      <<: *spark-env
+      SPARK_DAEMON_MEMORY: 256m
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-1400m}
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on: [spark-master]
+    restart: unless-stopped
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    command: [/opt/spark/bin/spark-class, org.apache.spark.deploy.worker.Worker, --webui-port, "8082", spark://spark-master:7077]
+    environment: *worker-env
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on: [spark-master]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Jobs Spark (soumis au cluster)
+  # Voie froide : Kafka -> HDFS (Parquet). Requête continue.
+  stream-archive:
+    <<: *spark-common
+    profiles: [streaming]
+    hostname: stream-archive
+    command: [bash, /opt/app/infra/spark/submit.sh, /opt/app/streaming/archive_to_hdfs.py]
+    depends_on: [spark-master, namenode, kafka]
+    restart: on-failure
+
+  # Voie chaude : Kafka -> modèle -> PostgreSQL. Requête continue.
+  stream-predict:
+    <<: *spark-common
+    profiles: [streaming]
+    hostname: stream-predict
+    command: [bash, /opt/app/infra/spark/submit.sh, /opt/app/streaming/predict_stream.py]
+    depends_on: [spark-master, namenode, kafka, postgres]
+    restart: on-failure
+
+  # Jobs batch ponctuels : `docker compose run --rm batch <script> [options]`.
+  batch:
+    <<: *spark-common
+    profiles: [batch]
+    hostname: batch
+    entrypoint: [bash, /opt/app/infra/spark/submit.sh]
+    command: [/opt/app/batch/indicators.py]
+    depends_on: [spark-master, namenode, postgres]
+
+  # Client HDFS pour inspecter le stockage : `docker compose run --rm hdfs dfs -ls -R /data`.
+  hdfs:
+    profiles: [tools]
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    env_file: ./infra/hadoop/hadoop.env
+    entrypoint: [/entrypoint.sh, hdfs]
+    command: [dfs, -ls, /]
+
+  # ---------------------------------------------------------------- Restitution
+  postgres:
+    image: postgres:16.4-alpine
+    hostname: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-port_eta}
+      POSTGRES_USER: ${POSTGRES_USER:-port_eta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-port_eta}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+    image: port-eta/dashboard:1.0
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-port_eta}
+      POSTGRES_USER: ${POSTGRES_USER:-port_eta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-port_eta}
+      REFRESH_SECONDS: ${DASHBOARD_REFRESH_SECONDS:-5}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  hdfs-namenode:
+  hdfs-datanode1:
+  hdfs-datanode2:
+  postgres-data:
