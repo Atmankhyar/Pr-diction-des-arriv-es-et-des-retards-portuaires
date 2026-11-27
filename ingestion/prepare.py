@@ -22,18 +22,48 @@ LABEL_COLUMNS = ("arrival_time_exists", "arrival_time", "actual_eta_in_min")
 
 
 def dumps(value):
-    """Sérialiser en JSON déterministe, sans nombres NaN ou infinis."""
+    """Sérialiser un objet Python en chaîne JSON déterministe et compacte.
+
+    Garanties :
+    - Clés triées alphabétiquement (sort_keys=True) pour garantir l'unicité du hachage.
+    - Caractères UTF-8 préservés sans échappement (ensure_ascii=False).
+    - Constantes NaN, Infinity et -Infinity formellement interdites (allow_nan=False).
+    - Séparateurs minimaux sans espaces superflus (',', ':').
+
+    Args:
+        value: Dictionnaire, liste ou type primitif JSON.
+
+    Returns:
+        str: Chaîne JSON normalisée.
+    """
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False,
                       separators=(",", ":"))
 
 
 def stable_id(value):
-    """Calculer un identifiant SHA-256 indépendant de l'ordre des clés JSON."""
+    """Calculer un identifiant SHA-256 déterministe et reproductible pour un objet.
+
+    L'objet est d'abord sérialisé via dumps() pour éliminer toute variation liée
+    à l'ordre des clés dans les dictionnaires.
+
+    Args:
+        value: Objet Python (dictionnaire, liste, tuple de valeurs primitives).
+
+    Returns:
+        str: Empreinte hexadécimale SHA-256 de 64 caractères.
+    """
     return hashlib.sha256(dumps(value).encode("utf-8")).hexdigest()
 
 
 def sha256_file(path):
-    """Calculer l'empreinte d'un fichier par blocs, avec une mémoire bornée."""
+    """Calculer l'empreinte SHA-256 d'un fichier par blocs de 1 Mo (mémoire bornée).
+
+    Args:
+        path (Path | str): Chemin d'accès au fichier sur le disque.
+
+    Returns:
+        str: Empreinte hexadécimale SHA-256 en minuscules.
+    """
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -42,12 +72,33 @@ def sha256_file(path):
 
 
 def get_timezone(name):
-    """Résoudre le fuseau déclaré ; aucune déduction géographique implicite."""
+    """Résoudre un nom de fuseau horaire IANA en objet timezone Python.
+
+    Args:
+        name (str): Nom du fuseau horaire (ex. 'UTC', 'Asia/Nicosia').
+
+    Returns:
+        timezone | ZoneInfo: Objet de fuseau horaire correspondant.
+    """
     return timezone.utc if name == "UTC" else ZoneInfo(name)
 
 
 def parse_time(value, zone):
-    """Convertir une date AIS2ETA en UTC, en refusant les ambiguïtés DST."""
+    """Convertir une date du dataset AIS2ETA (format JJ/MM/AAAA HH:MM) en UTC strict.
+
+    Détecte et rejette les ambiguïtés de passage à l'heure d'été/hiver (DST fold)
+    ou les heures locales inexistantes.
+
+    Args:
+        value (str): Chaîne horodatée source.
+        zone (timezone | ZoneInfo): Fuseau horaire d'interprétation.
+
+    Returns:
+        datetime: Objet datetime aware calé sur UTC (+00:00).
+
+    Raises:
+        ValueError: Si la date est ambiguë ou inexistante lors d'un changement d'heure.
+    """
     naive = datetime.strptime(value.strip(), "%d/%m/%Y %H:%M")
     first = naive.replace(tzinfo=zone, fold=0)
     second = naive.replace(tzinfo=zone, fold=1)
@@ -60,12 +111,29 @@ def parse_time(value, zone):
 
 
 def iso(value):
-    """Formater une date UTC à la seconde, précision du contrat historique."""
+    """Formater un objet datetime UTC au format ISO 8601 strict à la seconde (suffixe 'Z').
+
+    Args:
+        value (datetime): Objet date et heure en UTC.
+
+    Returns:
+        str: Chaîne au format 'AAAA-MM-JJTHH:MM:SSZ'.
+    """
     return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def number(value):
-    """Lire un nombre fini ou lever ValueError pour le traitement des rejets."""
+    """Convertir une chaîne en flottant fini en rejetant formellement NaN et infinis.
+
+    Args:
+        value: Valeur numérique ou chaîne convertible en float.
+
+    Returns:
+        float: Valeur flottante finie.
+
+    Raises:
+        ValueError: Si le nombre n'est pas fini (math.isnan ou math.isinf).
+    """
     result = float(value)
     if not math.isfinite(result):
         raise ValueError("nombre non fini")
@@ -73,7 +141,29 @@ def number(value):
 
 
 def observation(row, zone, timezone_name):
-    """Construire une observation sans cible à partir d'un enregistrement CSV."""
+    """Construire un dictionnaire d'observation AIS observable à partir d'une ligne du CSV.
+
+    Règles anti-fuite et qualité :
+    1. Validation du MMSI (vessel_id) : 9 chiffres requis.
+    2. Conversion de la date 'received_timestamp' en UTC.
+    3. Contrôle des coordonnées géographiques (-90 <= lat <= 90, -180 <= lon <= 180).
+    4. Validation des mesures capteurs (sog, cog, rot, nav_status, true_heading, dimensions).
+       Les valeurs hors bornes ou manquantes sont consignées dans 'quality_flags' sans invalider
+       toute l'observation si la position et l'horodatage restent exploitables.
+    5. Calcul de l'event_id stable à partir des champs observables uniquement.
+    6. Exclut formellement les colonnes cibles (arrival_time, actual_eta_in_min).
+
+    Args:
+        row (dict): Ligne de données extraite du CSV.
+        zone: Objet fuseau horaire pour la conversion UTC.
+        timezone_name (str): Nom du fuseau d'origine.
+
+    Returns:
+        dict: Observation normalisée conforme au schéma 'ais2eta.observation.v1'.
+
+    Raises:
+        ValueError: Si le MMSI ou les coordonnées géographiques sont invalides.
+    """
     mmsi = row["mmsi"].strip()
     if not re.fullmatch(r"[1-9][0-9]{8}", mmsi):
         raise ValueError("mmsi doit contenir 9 chiffres")
@@ -119,7 +209,27 @@ def observation(row, zone, timezone_name):
 
 
 def historical_label(row, event, zone):
-    """Conserver la cible historique séparément ; elle ne conditionne pas l'observation."""
+    """Créer le label historique (vérité terrain) associé à une observation AIS.
+
+    Garanties :
+    - Vérifie la présence de l'arrivée portuaire effective ('arrival_time_exists' == 'yes').
+    - Calcule remaining_hours = (arrival_time - observation_time) en heures.
+    - Contrôle de cohérence : l'écart entre le temps calculé et la colonne source
+      'actual_eta_in_min' doit être inférieur ou égal à 1,01 minute.
+    - Associe un voyage_id déterministe pour grouper les observations d'une même escale.
+
+    Args:
+        row (dict): Ligne de données extraite du CSV.
+        event (dict): Dictionnaire de l'observation correspondante.
+        zone: Fuseau horaire source.
+
+    Returns:
+        dict: Dictionnaire du label historique associé à l'event_id.
+
+    Raises:
+        ValueError: Si l'arrivée est absente, si remaining_hours est négatif,
+                    ou si le label calculé diverge de la colonne source.
+    """
     if row.get("arrival_time_exists", "").strip().lower() != "yes":
         raise ValueError("arrivee historique absente")
     arrival = parse_time(row["arrival_time"], zone)
@@ -144,10 +254,33 @@ def historical_label(row, event, zone):
 
 
 def prepare(input_path, output_dir, timezone_name, limit=5000, timezone_note="Non verifie aupres du producteur"):
-    """Créer un nouveau lot sur disque et retourner son manifeste de validation.
+    """Préparer un lot de données complet à partir du CSV brut et générer le manifeste d'audit.
 
-    limit borne les enregistrements source ; zéro signifie le fichier entier.
-    Un dossier existant est refusé. Le manifeste n'apparaît qu'après succès.
+    Étapes principales :
+    1. Validation des en-têtes et des colonnes obligatoires dans le CSV source.
+    2. Calcul de l'empreinte SHA-256 du fichier d'entrée.
+    3. Création d'une base SQLite temporaire (staging.sqlite) pour :
+       - Stocker les événements et détecter les doublons sur event_id.
+       - Gérer les conflits de labels (si deux lignes identiques ont des cibles divergentes).
+       - Trier les événements chronologiquement par (event_time, event_id).
+    4. Écriture des fichiers de sortie :
+       - 'observations.jsonl' : observations sans cible.
+       - 'labels.jsonl' : cibles associées.
+       - 'rejects.jsonl' : lignes rejetées avec le motif précis de l'échec.
+    5. Nettoyage de la base temporaire et génération de 'manifest.json' (compteurs, dates, SHA-256).
+
+    Args:
+        input_path (Path | str): Chemin du CSV brut source.
+        output_dir (Path | str): Dossier destination (ne doit pas exister préalablement).
+        timezone_name (str): Fuseau horaire source (ex. 'UTC').
+        limit (int): Nombre maximum de lignes à lire (0 = fichier complet).
+        timezone_note (str): Note documentaire associée au fuseau.
+
+    Returns:
+        dict: Manifeste complet du lot préparé.
+
+    Raises:
+        ValueError: Si limit est négatif, si le dossier existe déjà, ou si le CSV est invalide.
     """
     if limit < 0:
         raise ValueError("limit doit etre positif ou nul (0 = tout le CSV)")

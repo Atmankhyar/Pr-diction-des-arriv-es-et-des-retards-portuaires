@@ -16,6 +16,27 @@ from ingestion.producer import validate_batch
 
 
 def slice_batch(source_dir, output_dir, from_time=None, until_time=None, limit=0):
+    """Extraire d'un lot préparé une sous-fenêtre temporelle avec contrôle d'intégrité.
+
+    Fonctionnement :
+    1. Valide l'intégrité du lot source (contrôle des empreintes SHA-256 avec manifest.json).
+    2. Filtre les observations situées dans l'intervalle [from_time, until_time[.
+    3. Ne conserve dans 'labels.jsonl' que les cibles correspondant aux observations retenues.
+    4. Génère un nouveau fichier 'manifest.json' scellant le lot extrait.
+
+    Args:
+        source_dir (Path | str): Dossier du lot complet préparé (ex. data/prepared/full).
+        output_dir (Path | str): Dossier de sortie pour le sous-lot extrait (ex. data/prepared/live).
+        from_time (str | None): Date de début incluse au format ISO UTC (ex. '2020-08-25T00:00:00Z').
+        until_time (str | None): Date de fin exclue au format ISO UTC.
+        limit (int): Nombre maximal d'observations à extraire (0 = aucune limite).
+
+    Returns:
+        dict: Manifeste complet du sous-lot produit.
+
+    Raises:
+        ValueError: Si le lot source est corrompu ou si aucune observation ne correspond à la fenêtre.
+    """
     source_dir, output_dir = Path(source_dir), Path(output_dir)
     manifest, _ = validate_batch(source_dir)  # refuse un lot source modifié
     start = utc_time(from_time) if from_time else None
