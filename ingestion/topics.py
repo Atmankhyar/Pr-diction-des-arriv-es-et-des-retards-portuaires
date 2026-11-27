@@ -7,7 +7,24 @@ from ingestion.producer import wait_for_topics
 
 
 def create_topics(bootstrap_servers, topics, partitions=3, timeout=30):
-    """Créer les topics absents puis vérifier partitions et réplication 1."""
+    """Créer les topics Kafka avec le nombre de partitions et la rétention voulus, puis valider leur disponibilité.
+
+    Étapes :
+    1. Valider syntaxiquement chaque nom de topic.
+    2. Utiliser confluent_kafka.admin.AdminClient pour créer les topics de manière idempotente.
+    3. Rétention fixée à 7 jours (604 800 000 ms), facteur de réplication = 1 (cluster local).
+    4. Attendre la propagation des métadonnées sur le broker KRaft.
+    5. Vérifier que chaque topic existe, est sans erreur et possède exactement le nombre de partitions attendu.
+
+    Args:
+        bootstrap_servers (str): Adresse(s) d'accès aux brokers Kafka (ex. 'kafka:9092').
+        topics (list[str]): Noms des topics à créer (ex. ['maritime.observations.v1', 'maritime.labels.v1']).
+        partitions (int): Nombre de partitions par topic (défaut = 3 pour paralléliser).
+        timeout (float): Délai maximal d'attente en secondes.
+
+    Raises:
+        RuntimeError: Si un topic est introuvable, signale une erreur ou n'a pas le bon nombre de partitions.
+    """
     from confluent_kafka import KafkaError, KafkaException
     from confluent_kafka.admin import AdminClient, NewTopic
     for topic in topics:

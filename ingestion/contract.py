@@ -16,30 +16,78 @@ ENVELOPE_FIELDS = {"ingestion_time", "ingestion_run_id", "ingestion_batch_id"}
 
 
 def loads(value):
-    """Décoder du JSON strict : NaN et Infinity sont refusés."""
+    """Décoder une chaîne JSON en mode strict : refuse formellement NaN, Infinity et -Infinity.
+
+    Args:
+        value (str | bytes): Chaîne ou octets au format JSON.
+
+    Returns:
+        dict | list | int | float | str | bool | None: Objet Python désérialisé.
+
+    Raises:
+        ValueError: Si une constante JSON interdite (NaN, Infinity) est détectée.
+    """
     def invalid_constant(constant):
         raise ValueError(f"Constante JSON interdite : {constant}")
     return json.loads(value, parse_constant=invalid_constant)
 
 
 def utc_time(value):
-    """Valider une date ISO 8601 UTC et retourner son objet datetime."""
+    """Valider une date ISO 8601 UTC stricte (suffixe 'Z') et retourner un objet datetime.
+
+    Args:
+        value (str): Horodatage ISO 8601 se terminant obligatoirement par 'Z'.
+
+    Returns:
+        datetime: Objet datetime aware avec fuseau horaire UTC (+00:00).
+
+    Raises:
+        ValueError: Si le format n'est pas une chaîne valide avec le suffixe 'Z'.
+    """
     if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError("Horodatage ISO 8601 UTC attendu avec suffixe Z")
     return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
 def validate_topic(topic):
-    """Refuser les noms incompatibles avec Kafka avant tout appel réseau."""
+    """Valider la conformité d'un nom de topic Kafka avant tout appel réseau.
+
+    Un nom de topic Kafka valide doit comporter entre 1 et 249 caractères alphanumériques,
+    points, tirets ou tirets bas, et ne pas être '.' ou '..'.
+
+    Args:
+        topic (str): Nom du topic Kafka à valider.
+
+    Returns:
+        str: Le nom du topic s'il est valide.
+
+    Raises:
+        ValueError: Si le nom ne respecte pas les contraintes syntaxiques de Kafka.
+    """
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,249}", topic) or topic in {".", ".."}:
         raise ValueError(f"Nom de topic Kafka invalide : {topic!r}")
     return topic
 
 
 def validate_observation(event, *, published=False):
-    """Vérifier champs, types et bornes sans convertir ni inventer de valeur.
+    """Vérifier le contrat d'une observation AIS : présence des champs, types et bornes physiques.
 
-    La liste fermée de champs exclut les labels futurs et les colonnes non vérifiées.
+    Garanties :
+    1. Liste fermée de champs : aucun champ inattendu (anti-fuite de données futures).
+    2. Version de schéma = 1 et source = 'ais2eta'.
+    3. Identifiant unique 'event_id' = SHA-256 de 64 caractères hexadécimaux.
+    4. Identifiant navire 'vessel_id' = MMSI de 9 chiffres (ne commençant pas par 0).
+    5. Horodatage 'event_time' ISO 8601 UTC valide.
+    6. Bornes physiques maritimes (latitude [-90, 90], longitude [-180, 180],
+       vitesse [0, 102.2] nœuds, cap [0, 359]°, taux de giration [-708, 708]°/min).
+    7. Métadonnées d'enveloppe (ingestion_time, ingestion_run_id, ingestion_batch_id) si published=True.
+
+    Args:
+        event (dict): Dictionnaire représentant l'observation AIS.
+        published (bool): Si True, valide également les champs d'enveloppe ajoutés lors de l'envoi Kafka.
+
+    Raises:
+        ValueError: Si un champ manque, a un type incorrect ou dépasse ses bornes physiques.
     """
     required = {"schema_version", "source", "event_id", "event_time", "source_timezone",
                 "vessel_id", "voyage_id", "quality_flags", *NUMERIC_FIELDS, *TEXT_FIELDS}

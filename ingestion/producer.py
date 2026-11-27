@@ -20,7 +20,19 @@ LABELS_TOPIC = "maritime.labels.v1"
 
 
 def records(batch_dir, topic=OBSERVATIONS_TOPIC, labels_topic=LABELS_TOPIC, include_labels=True):
-    """Parcourir le lot ligne à ligne ; les labels utilisent un topic distinct."""
+    """Générateur parcourant séquentiellement les enregistrements JSONL d'un lot préparé.
+
+    Associe chaque enregistrement à son topic cible dédié (observations ou labels).
+
+    Args:
+        batch_dir (Path | str): Chemin du dossier de lot contenant les fichiers jsonl.
+        topic (str): Nom du topic Kafka pour les observations.
+        labels_topic (str): Nom du topic Kafka pour les labels.
+        include_labels (bool): Si True, inclut également les labels historiques.
+
+    Yields:
+        tuple[str, dict]: Couple (topic_destination, dictionnaire_événement).
+    """
     files = [("observations.jsonl", topic)]
     if include_labels:
         files.append(("labels.jsonl", labels_topic))
@@ -31,7 +43,23 @@ def records(batch_dir, topic=OBSERVATIONS_TOPIC, labels_topic=LABELS_TOPIC, incl
 
 
 def validate_batch(batch_dir):
-    """Vérifier intégrité, contrat et ordre du lot avant toute connexion Kafka."""
+    """Vérifier l'intégrité cryptographique, la conformité du contrat et l'ordre chronologique d'un lot.
+
+    Contrôles préalables (sans connexion Kafka) :
+    1. Vérifie les empreintes SHA-256 des fichiers observations, labels et rejects par rapport au manifeste.
+    2. Valide chaque observation avec validate_observation() pour certifier les bornes et types.
+    3. Vérifie le tri chronologique strict sur (event_time, event_id).
+    4. Confirme que le nombre total de lignes correspond exactement aux compteurs du manifeste.
+
+    Args:
+        batch_dir (Path | str): Dossier du lot à auditer.
+
+    Returns:
+        tuple[dict, Counter]: (manifeste_json, compteurs_par_topic).
+
+    Raises:
+        ValueError: Si le lot a été altéré, est mal trié ou contient des anomalies contractuelles.
+    """
     batch_dir = Path(batch_dir)
     manifest = loads((batch_dir / "manifest.json").read_text(encoding="utf-8"))
     for filename in ("observations.jsonl", "labels.jsonl", "rejects.jsonl"):
@@ -56,16 +84,45 @@ def validate_batch(batch_dir):
 
 
 def delivery_counts():
-    """Initialiser les compteurs avant la connexion, y compris pour un échec réseau."""
+    """Initialiser la structure des compteurs d'audit de livraison Kafka.
+
+    Returns:
+        Counter: Compteurs à zéro pour enqueued, delivered, failed, enqueue_failed, pending, stopped.
+    """
     return Counter(enqueued=0, delivered=0, failed=0, enqueue_failed=0, pending=0, stopped=0)
 
 
 def deliver(producer, messages, receipts, failures, run_id, batch_id, rate=0,
             timeout=30, *, counts=None, stop_requested=lambda: False):
-    """Publier puis vider la file, même après erreur ou demande d'arrêt.
+    """Publier les messages dans Kafka avec régulation de débit et traçabilité individuelle.
 
-    counts est modifié sur place pour conserver un bilan si une exception survient.
-    Chaque confirmation conserve l'empreinte exacte du JSON envoyé et son offset.
+    Mécanisme :
+    1. Enveloppe chaque événement avec les métadonnées d'ingestion (run_id, batch_id, timestamp).
+    2. Partitionnement garanti : clé = MMSI (vessel_id), pour que toutes les positions d'un même
+       navire arrivent sur la même partition Kafka dans l'ordre chronologique.
+    3. Callback de livraison on_delivery :
+       - Succès : écrit dans receipts.jsonl (topic, partition, offset, SHA-256 du payload envoyé).
+       - Échec : écrit dans failures.jsonl (motif de rejet par Kafka).
+    4. Régulation de débit (rate > 0) pour simuler un flux temps réel si demandé.
+    5. Vidage complet de la file d'attente (producer.flush) à la fin ou en cas d'interruption.
+
+    Args:
+        producer: Instance de confluent_kafka.Producer.
+        messages: Itérateur produisant des tuples (topic, événement).
+        receipts: Fichier ouvert pour consigner les accusés de réception.
+        failures: Fichier ouvert pour consigner les rejets.
+        run_id (str): Identifiant unique de cette exécution.
+        batch_id (str): Empreinte d'identification du lot source.
+        rate (float): Vitesse d'envoi en messages/seconde (0 = vitesse maximale).
+        timeout (float): Délai d'expiration du flush en secondes.
+        counts (Counter): Compteurs de suivi mis à jour sur place.
+        stop_requested (callable): Fonction retournant True si un arrêt propre est demandé.
+
+    Returns:
+        dict: Bilan final des comptages de livraison.
+
+    Raises:
+        RuntimeError: En cas de message rejeté ou de livraison incomplète.
     """
     counts = delivery_counts() if counts is None else counts
 
@@ -139,7 +196,20 @@ def deliver(producer, messages, receipts, failures, run_id, batch_id, rate=0,
 
 
 def wait_for_topics(producer, topics, timeout, stop_requested=lambda: False):
-    """Attendre les métadonnées avec une échéance globale, sans créer de topic."""
+    """Attendre que les métadonnées de tous les topics requis soient disponibles sur le cluster Kafka.
+
+    Permet d'éviter d'envoyer des messages vers un topic non encore propagé ou en cours d'élection de leader.
+
+    Args:
+        producer: Client Kafka utilisé pour interroger les métadonnées de cluster.
+        topics (iterable[str]): Liste ou ensemble de topics à attendre.
+        timeout (float): Délai d'attente maximum en secondes.
+        stop_requested (callable): Fonction retournant True si un arrêt est demandé.
+
+    Raises:
+        TimeoutError: Si les topics ne sont pas prêts dans le délai alloué.
+        InterruptedError: Si l'utilisateur interrompt la commande.
+    """
     deadline, last_error = time.monotonic() + timeout, "topics absents"
     while time.monotonic() < deadline:
         if stop_requested():
@@ -159,10 +229,32 @@ def wait_for_topics(producer, topics, timeout, stop_requested=lambda: False):
 def publish(batch_dir, bootstrap_servers, report_dir, *, topic=OBSERVATIONS_TOPIC,
             labels_topic=LABELS_TOPIC, include_labels=False, rate=100, timeout=30,
             stop_requested=lambda: False, producer_factory=None):
-    """Retourner et enregistrer le bilan d'une tentative de publication.
+    """Orchestrer la publication d'un lot dans Kafka et générer le rapport d'audit de livraison.
 
-    Les erreurs locales de contrat sont levées avant la connexion. Les erreurs
-    réseau et les interruptions produisent un bilan sans annoncer de succès.
+    Garanties de robustesse et d'idempotence :
+    1. Validation locale complète du lot (contrat et empreintes SHA-256) avant connexion réseau.
+    2. Configuration producteur : idempotence activée (enable.idempotence=True), acks='all',
+       compression gzip et délai de groupage (linger.ms=10).
+    3. Attente préalable de la disponibilité effective des topics (wait_for_topics).
+    4. Journalisation détaillée de chaque confirmation dans '{run_id}.receipts.jsonl'
+       (offset, partition et SHA-256 exact du message).
+    5. En cas d'interruption (Ctrl+C) ou d'incident, un rapport intermédiaire '{run_id}.summary.json'
+       est systématiquement persisté.
+
+    Args:
+        batch_dir (Path | str): Dossier contenant le lot préparé.
+        bootstrap_servers (str): Adresses des brokers Kafka (ex. 'kafka:9092').
+        report_dir (Path | str): Dossier de sortie des rapports d'audit (data/reports).
+        topic (str): Nom du topic des observations (défaut 'maritime.observations.v1').
+        labels_topic (str): Nom du topic des labels (défaut 'maritime.labels.v1').
+        include_labels (bool): Publier également les labels historiques si True.
+        rate (float): Débit d'envoi en msgs/s (0 = débit maximal sans attente).
+        timeout (float): Délai maximal alloué pour le flush et les requêtes.
+        stop_requested (callable): Prédicat indiquant une demande d'interruption.
+        producer_factory: Fabrique de producteur alternatif (utile pour les mocks).
+
+    Returns:
+        dict: Synthèse de publication avec run_id, statut, décomptes et chemins des reçus.
     """
     if not math.isfinite(rate) or rate < 0 or not math.isfinite(timeout) or timeout < 0.2:
         raise ValueError("Débit fini >= 0 et délai fini >= 0,2 s requis")

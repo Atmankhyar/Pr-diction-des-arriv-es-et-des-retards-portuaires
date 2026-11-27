@@ -13,6 +13,8 @@ CSV AIS2ETA → producteur Python → Kafka → Spark Structured Streaming ─�
 | [docs/donnees.md](docs/donnees.md) | Provenance, licence, volume, sens d'un événement, cible, colonnes exclues |
 | [docs/architecture.md](docs/architecture.md) | Schéma des services et des flux, rôle des conteneurs, organisation HDFS, reprise |
 | [docs/roles.md](docs/roles.md) | Répartition entre les 4 étudiants et fichiers que chacun doit maîtriser |
+| [docs/run_pipeline.md](docs/run_pipeline.md) | Guide pas à pas d'exécution du pipeline et résolution des conflits |
+| [docs/project_summary.pdf](docs/project_summary.pdf) | Synthèse PDF complète du projet, de l'architecture et des rôles |
 | `docs/results/metrics_latest.json` | Résultats ML produits par l'entraînement (créé au premier entraînement) |
 
 ## Cas métier
